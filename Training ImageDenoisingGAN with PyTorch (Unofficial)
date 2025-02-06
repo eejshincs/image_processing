@@ -1,0 +1,311 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+import random
+import os
+from os import listdir
+from os.path import join
+import argparse
+import torchvision
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.parallel
+import torch.optim as optim
+import torch.utils.data as data
+import torchvision.datasets as dset
+import torchvision.transforms as transforms
+import torchvision.utils as vutils
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+from PIL import Image
+from IPython.display import HTML
+from torch.utils.data import Dataset, DataLoader
+
+manualseed = 121
+print("Random Seed: ", manualseed)
+random.seed(manualseed)
+torch.manual_seed(manualseed)
+torch.use_deterministic_algorithms(True)
+
+batchsize = 50
+
+nc = 3
+
+ngf = 32
+
+ndf = 48
+
+num_epochs = 500
+
+lr = 0.002
+
+beta1 = 0.5
+
+ngpu = 1
+
+
+
+data_dir_t = '/content/drive/MyDrive/DenoisingGAN/train_dataset/'
+
+device = torch.device("cuda:0" if (torch.cuda.is_available() and ngpu > 0) else "cpu")
+
+def weights_init(m):
+    if isinstance(m, nn.Conv2d):  
+        nn.init.normal_(m.weight.data, 0.0, 0.02)
+    elif isinstance(m, nn.BatchNorm2d):  
+        nn.init.normal_(m.weight.data, 1.0, 0.02)
+        nn.init.constant_(m.bias.data, 0)
+
+def is_image_file(filename):
+    return any(filename.endswith(extension) for extension in [".png", ".jpg", ".jpeg",".bmp"])
+
+def load_img(filepath, ch):
+    if ch == 1:
+      img = Image.open(filepath)#.convert('RGB')
+    elif ch == 3:
+      img = Image.open(filepath).convert('RGB')
+    return img
+
+class TrainDataset(data.Dataset):
+  def __init__(self, data_dir_t):
+    super(TrainDataset, self).__init__()
+    self.image_filenames_blur = [join(data_dir_t+'ximage/', data) for data in sorted(listdir(data_dir_t+'ximage/')) if is_image_file(data)]
+    self.image_filenames_sharp = [join(data_dir_t+'yimage/', data) for data in sorted(listdir(data_dir_t+'yimage/')) if is_image_file(data)]
+    self.ch = 3
+
+  def __getitem__(self, index):
+    img_blur = load_img(self.image_filenames_blur[index], self.ch)
+    img_sharp = load_img(self.image_filenames_sharp[index], self.ch)
+    img_blur = transforms.ToTensor()(img_blur)
+    img_sharp = transforms.ToTensor()(img_sharp)
+
+
+    return img_blur, img_sharp
+
+  def __len__(self):
+    return len(self.image_filenames_blur)
+
+
+def get_training_set(data_dir_t):
+  return TrainDataset(data_dir_t)
+
+train_data_loader = DataLoader(dataset = TrainDataset(data_dir_t), batch_size = batchsize, shuffle = True, num_workers = 1)
+
+class RB(nn.Module):
+    def __init__(self):
+        super(RB, self).__init__()
+        self.block = nn.Sequential(
+            nn.Conv2d(128, 128, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(128, 128, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(128)
+        )
+
+    def forward(self, x):
+        return x + self.block(x)  # Residual connection
+
+class SubPixelConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, upscale_factor=2):
+        super(SubPixelConv2d, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels * (upscale_factor ** 2), 3, 1, 1, bias=False)
+        self.bn = nn.BatchNorm2d(out_channels * (upscale_factor ** 2))
+        self.pixel_shuffle = nn.PixelShuffle(upscale_factor)
+        self.leaky_relu = nn.LeakyReLU(0.2, inplace=True)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.bn(x)
+        x = self.pixel_shuffle(x)  # (B, out_channels, 2H, 2W)로 변환됨
+        x = self.leaky_relu(x)
+        return x
+
+class Generator(nn.Module):
+    def __init__(self, ngpu):
+        super(Generator, self).__init__()
+        self.ngpu = ngpu
+
+        self.front = nn.Sequential(
+            nn.Conv2d(3, 32, 9, 1, 4, bias=False),
+            nn.BatchNorm2d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(32, 64, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv2d(64, 128, 3, 1, 1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+
+        self.RBs = nn.Sequential(RB(), RB(), RB())
+
+        self.SubPixelConv2d1 = SubPixelConv2d(128, 64, upscale_factor=2)
+        self.SubPixelConv2d2 = SubPixelConv2d(64, 32, upscale_factor=2)
+
+        self.rear = nn.Sequential(
+            nn.Conv2d(32, 3, 4, 4, 0, bias=False),
+            nn.BatchNorm2d(3),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        y = self.front(x)
+        y = self.RBs(y)  # RB 블록 3번 적용
+        y = self.SubPixelConv2d1(y)
+        y = self.SubPixelConv2d2(y)
+        y = self.rear(y)
+        y = y + x
+        return y
+
+netG = Generator(ngpu).to(device)
+if (device.type == 'cuda') and (ngpu > 1):
+  netG = nn.DataParallel(netG, list(range(ngpu)))
+netG.apply(weights_init)
+print(netG)
+
+class Discriminator(nn.Module):
+  def __init__(self, ngpu):
+    super(Discriminator, self).__init__()
+    self.ngpu = ngpu
+    self.main = nn.Sequential(
+        nn.Conv2d(3, 48, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(48),
+        nn.LeakyReLU(0.2, inplace = True),
+        nn.Conv2d(48, 96, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(96),
+        nn.LeakyReLU(0.2, inplace = True),
+        nn.Conv2d(96, 192, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(192),
+        nn.LeakyReLU(0.2, inplace = True),
+        nn.Conv2d(192, 384, 4, 2, 1, bias=False),
+        nn.BatchNorm2d(384),
+        nn.LeakyReLU(0.2, inplace = True),
+        nn.Conv2d(384, 1, 4, 1, 0, bias=False),
+        nn.BatchNorm2d(1),
+        nn.Sigmoid()
+    )
+  def forward(self, x):
+    return self.main(x)
+
+netD = Discriminator(ngpu).to(device)
+if (device.type == 'cuda') and (ngpu > 1):
+  netD = nn.DataParallel(netD, list(range(ngpu)))
+netD.apply(weights_init)
+print(netD)
+
+lambda_a = 0.5
+lambda_p = 1.0
+lambda_s = 0.0001
+
+beta1 = 0.5
+
+real_label = 1.
+fake_label = 0.
+
+optimizerD = optim.Adam(netD.parameters(), lr=lr, betas=(beta1, 0.999))
+optimizerG = optim.Adam(netG.parameters(), lr=lr, betas=(beta1, 0.999))
+
+def smooth_loss(image):
+  batch, channel, height, width = image.shape
+
+  horizontal_image = image[:, :, :, :-1]
+  horizontal_shift_image = image[:, :, :, 1:]
+
+  vertical_image = image[:, :, :-1, :]
+  vertical_shift_image = image[:, :, 1:, :]
+
+  smooth_loss = F.mse_loss(horizontal_image, horizontal_shift_image) + F.mse_loss(vertical_image, vertical_shift_image)
+  return smooth_loss
+
+def criterionG(output, GT, fake, label, lambda_a, lambda_p, lambda_s):
+  adversarial_loss = nn.BCELoss()(output, label)
+  pixel_loss = nn.MSELoss()(fake, GT)
+  smooth_loss_func = smooth_loss(fake)
+  return lambda_a * adversarial_loss + lambda_p * pixel_loss + lambda_s * smooth_loss_func
+
+criterionD = nn.BCELoss()
+
+img_list = []
+G_losses = []
+D_losses = []
+iters = 0
+
+print("Starting Training Loop...")
+
+for epoch in range(num_epochs):
+  for i, batch in enumerate(train_data_loader):
+
+    img_y, img_x = batch
+    img_y = img_y.to(device)
+    img_x = img_x.to(device)
+
+
+    # Update of D trained with real images
+    netD.zero_grad()
+    real_cpu = img_x.to(device)
+    batch_size = real_cpu.size(0)
+    label = torch.full((batch_size,), real_label, dtype = torch.float, device = device)
+    #print(img_x.shape)
+    #print(netD(real_cpu).shape)
+    output = netD(real_cpu).view(-1)
+
+    errorD_real = criterionD(output, label)
+    errorD_real.backward()
+
+    D_real = output.mean().item()
+
+    # Update of D trained with fake images
+    fake_cpu = img_y.to(device)
+    label.fill_(fake_label)
+
+    fake = netG(fake_cpu)
+
+    output = netD(fake.detach()).view(-1)
+
+    errorD_fake = criterionD(output, label)
+    errorD_fake.backward()
+
+    D_G_fake1 = output.mean().item()
+
+    errorD = errorD_real + errorD_fake
+
+    optimizerD.step()
+
+    # Update of G trained with the updated D
+    netG.zero_grad()
+    label.fill_(real_label)
+
+    output = netD(fake).view(-1)
+
+    errorG = criterionG(output, img_x, fake, label, lambda_a, lambda_p, lambda_s)
+    errorG.backward()
+
+    D_G_fake2 = output.mean().item()
+
+    optimizerG.step()
+
+    if (i+1) % 1 == 0:
+      print('[%2d/%2d] [%2d/%2d]\tLoss_D: %2.4f\tLoss_G: %2.4f\tD_real: %2.4f\tD_G_fake1: %2.4f\tD_G_fake2: %2.4f'
+      % (epoch, num_epochs, i+1, len(train_data_loader), errorD.item(), errorG.item(), D_real, D_G_fake1, D_G_fake2))
+
+    G_losses.append(errorG.item())
+    D_losses.append(errorD.item())
+
+    if ((i+1) % 20 == 0 or (epoch == num_epochs-1 and i == len(train_data_loader)-1)):
+      with torch.no_grad():
+        fake = netG(img_y).detach().cpu()
+      img_list.append(vutils.make_grid(fake, padding=2, normalize=False))
+
+
+      img_numpy = img_list[-1].cpu().numpy()
+
+      img_numpy = np.transpose(img_numpy, (1, 2, 0))  
+      img_numpy = (img_numpy * 255).astype(np.uint8)  # Scale to [0, 255] and convert to uint8
+
+    
+      plt.figure(figsize=(8, 8))
+      plt.imshow(img_numpy)
+      plt.axis('off')  
+      plt.show()
